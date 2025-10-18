@@ -4,6 +4,7 @@ import subprocess
 import time
 from io import BytesIO
 from typing import Callable, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from dotenv import load_dotenv
@@ -205,7 +206,8 @@ def azure_document_intelligence_ocr(png_path: str) -> str:
                 continue
 
             raise RuntimeError(
-                f"Failed to poll Azure results: {result_response.status_code} - {result_response.text}"
+                f"Failed to poll Azure results: {result_response.status_code} - "
+                f"{result_response.text}"
             )
 
         # Timeout
@@ -220,6 +222,33 @@ def azure_document_intelligence_ocr(png_path: str) -> str:
         raise RuntimeError(f"Azure Document Intelligence error: {e}") from e
 
 
+def process_single_page(
+    pdf_path: str,
+    page_num: int,
+    dpi: int,
+    out_dir: str,
+    keep_png: bool = False
+) -> tuple[int, str]:
+    """Process a single page and return (page_num, text)."""
+    png_path = os.path.join(out_dir, f"ocr_page_{page_num}_{dpi}.png")
+
+    if render_page_to_png(pdf_path, page_num, png_path, dpi=dpi):
+        try:
+            text = azure_document_intelligence_ocr(png_path)
+        except (RuntimeError, requests.exceptions.RequestException) as e:
+            text = f"(OCR error: {str(e)})"
+
+        if not keep_png:
+            try:
+                os.remove(png_path)
+            except OSError:
+                pass
+    else:
+        text = "(render failed)"
+
+    return page_num, text
+
+
 def extract_pdf_to_markdown(
     pdf_path: str,
     out_md_path: str,
@@ -228,8 +257,9 @@ def extract_pdf_to_markdown(
     start_page: Optional[int] = None,
     end_page: Optional[int] = None,
     keep_png: bool = False,
+    max_workers: int = 8,
 ) -> None:
-    """Extract text from PDF pages using Azure Document Intelligence OCR."""
+    """Extract text from PDF pages using Azure Document Intelligence OCR with batch processing."""
     reader = PdfReader(pdf_path)
     num_pages = len(reader.pages)
 
@@ -251,41 +281,59 @@ def extract_pdf_to_markdown(
     if s != 1 or e != num_pages:
         lines.append(f"Processed range: {s}-{e}")
     lines.append("OCR Engine: Azure Document Intelligence")
+    lines.append(f"Processing: {max_workers} concurrent workers")
     lines.append("")
 
     out_dir = os.path.dirname(out_md_path)
-    for idx, p in enumerate(pages):
+
+    # Process pages in batches with controlled concurrency
+    page_results: dict[int, str] = {}
+    completed_count = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all page processing tasks
+        future_to_page = {
+            executor.submit(process_single_page, pdf_path, p, effective_dpi, out_dir, keep_png): p
+            for p in pages
+        }
+
+        # Collect results as they complete
+        for future in as_completed(future_to_page):
+            try:
+                page_num, text = future.result()
+                page_results[page_num] = text
+                completed_count += 1
+
+                if progress:
+                    try:
+                        progress(completed_count, total_to_process)
+                    except (OSError, ValueError):
+                        pass
+
+            except (RuntimeError, requests.exceptions.RequestException, OSError) as e:
+                page_num = future_to_page[future]
+                page_results[page_num] = f"(processing error: {str(e)})"
+                completed_count += 1
+
+                if progress:
+                    try:
+                        progress(completed_count, total_to_process)
+                    except (OSError, ValueError):
+                        pass
+
+    # Write results in page order
+    for p in sorted(pages):
         lines.append(f"## Page {p}")
-        png_path = os.path.join(out_dir, f"ocr_page_{p}_{effective_dpi}.png")
+        text: str = page_results.get(p, "(not processed)")
 
-        if render_page_to_png(pdf_path, p, png_path, dpi=effective_dpi):
-            text = azure_document_intelligence_ocr(png_path)
-
-            if not keep_png:
-                try:
-                    os.remove(png_path)
-                except OSError:
-                    pass
-        else:
-            text = ""
-
-        if text.strip():
+        if text.strip() and not text.startswith("("):
             lines.append("")
             lines.append("```text")
             lines.append(text.strip())
             lines.append("```")
         else:
-            lines.append("(no text)")
+            lines.append(text)
         lines.append("")
-
-        if progress:
-            try:
-                progress(idx + 1, total_to_process)
-            except (OSError, ValueError):
-                pass
-
-        # Gentle pacing between page submissions to avoid hitting service TPS limits
-        time.sleep(0.3)
 
     with open(out_md_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
