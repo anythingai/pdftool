@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PDF → Markdown</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ctext y='50' font-size='48'%3E%F0%9F%93%84%3C/text%3E%3C/svg%3E" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0b0f1a;
+      --surface: #0f1424;
+      --surface-2: #0d1323;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --primary: #7c3aed;
+      --primary-700: #6d28d9;
+      --ring: rgba(124, 58, 237, 0.35);
+      --border: #1f2937;
+      --accent-gradient: radial-gradient(1200px 600px at 0% 0%, rgba(124,58,237,.25), transparent 50%),
+                         radial-gradient(600px 400px at 100% 0%, rgba(99,102,241,.15), transparent 50%),
+                         radial-gradient(600px 600px at 100% 100%, rgba(147,51,234,.2), transparent 50%);
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0; background: var(--bg); color: var(--text);
+      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      display: grid; min-height: 100vh; place-items: center;
+    }
+    .container { width: 100%; max-width: 820px; padding: 24px; }
+    .card {
+      position: relative; border: 1px solid var(--border); border-radius: 16px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));
+      box-shadow: 0 1px 0 rgba(255,255,255,0.08) inset, 0 8px 40px rgba(0,0,0,0.45);
+      overflow: hidden; padding: 32px 28px;
+    }
+    .card::before { content: ""; position: absolute; inset: -1px; background: var(--accent-gradient); filter: blur(60px); z-index: 0; pointer-events: none; }
+    .stack { position: relative; z-index: 1; display: grid; gap: 20px; }
+
+    header .title { margin: 0; font-size: 28px; font-weight: 700; letter-spacing: -0.01em; }
+    header .subtitle { margin: 4px 0 0; color: var(--muted); font-size: 16px; }
+
+    .icon-wrap { display: grid; place-items: center; }
+    .icon {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 64px; height: 64px; border-radius: 14px;
+      background: rgba(124,58,237,0.12); color: var(--primary); font-size: 28px;
+      border: 1px solid rgba(124,58,237,0.35);
+    }
+
+    .dropzone {
+      position: relative; border: 1px dashed #334155; background: var(--surface-2);
+      border-radius: 14px; padding: 28px; display: grid; gap: 10px; place-items: center;
+      transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.06s ease;
+    }
+    .dropzone.dragover { border-color: var(--primary); box-shadow: 0 0 0 4px var(--ring); transform: translateY(-1px); }
+    .hidden-input { display: none; }
+    .dz-label { font-weight: 600; font-size: 16px; }
+    .dz-help { color: var(--muted); font-size: 14px; }
+    .actions { display: inline-flex; gap: 10px; }
+    .btn { appearance: none; border: 1px solid var(--border); background: linear-gradient(180deg, #121a2e, #0d1426); color: var(--text); border-radius: 6px; padding: 6px 8px; font-weight: 600; font-size: 13px; cursor: pointer; transition: box-shadow 0.2s ease, transform 0.06s ease; }
+    .btn:hover { box-shadow: 0 0 0 4px var(--ring); }
+    .btn:active { transform: translateY(1px); }
+    .btn-primary { background: linear-gradient(180deg, var(--primary), var(--primary-700)); border-color: rgba(124,58,237,0.5); }
+
+    .status { margin-top: 6px; color: var(--muted); min-height: 22px; }
+    .progress { display: none; align-items: center; gap: 10px; }
+    .spinner { width: 18px; height: 18px; border-radius: 50%; border: 2px solid #334155; border-top-color: var(--primary); animation: spin 0.9s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .result { display: none; margin-top: 8px; padding: 16px; border: 1px solid var(--border); border-radius: 12px; background: #0c1222; }
+    .result a { color: var(--text); font-weight: 600; text-decoration: none; }
+    .result a:hover { text-decoration: underline; }
+
+    .meter { display: none; height: 8px; border-radius: 999px; background: #0b1323; border: 1px solid var(--border); overflow: hidden; }
+    .meter > .fill { height: 100%; width: 0%; background: linear-gradient(90deg, var(--primary), #8b5cf6); transition: width 0.2s ease; }
+
+    footer { margin-top: 6px; color: var(--muted); font-size: 13px; text-align: center; }
+  </style>
+</head>
+<body>
+  <main class="container" aria-label="PDF to Markdown converter">
+    <section class="card">
+      <div class="stack">
+        <header>
+          <h1 class="title">PDF → Markdown</h1>
+          <p class="subtitle">Upload a PDF and get a clean Markdown file. The app uses OCR automatically for all pages.</p>
+        </header>
+
+        <div class="icon-wrap" aria-hidden="true">
+          <div class="icon">📄</div>
+        </div>
+
+        <form id="uploadForm" aria-labelledby="uploadLabel">
+          <div class="dropzone" id="dropzone" tabindex="0" role="button" aria-describedby="dzHelp">
+            <label id="uploadLabel" for="pdfFile" class="dz-label">Drag & drop your PDF here</label>
+            <div class="dz-help" id="dzHelp">or <span class="actions"><span class="btn btn-primary" id="browseBtn" role="button" aria-label="Browse files">Browse files</span></span></div>
+            <input type="file" id="pdfFile" name="file" class="hidden-input" accept="application/pdf" required title="Select a PDF file" aria-label="Select a PDF file" />
+          </div>
+
+          <div id="status" class="status" role="status" aria-live="polite"></div>
+          <div id="progress" class="progress"><div class="spinner" aria-hidden="true"></div> <span id="progressText">Processing…</span></div>
+          <div class="meter" id="meter" aria-hidden="true"><div class="fill" id="meterFill"></div></div>
+          <div id="result" class="result" aria-live="polite"></div>
+          <footer>Your file is processed locally on the server. Temporary OCR artifacts are deleted automatically.</footer>
+        </form>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const dropzone = document.getElementById('dropzone');
+    const fileInput = document.getElementById('pdfFile');
+    const browseBtn = document.getElementById('browseBtn');
+    const statusEl = document.getElementById('status');
+    const progressEl = document.getElementById('progress');
+    const progressText = document.getElementById('progressText');
+    const resultEl = document.getElementById('result');
+    const meter = document.getElementById('meter');
+    const meterFill = document.getElementById('meterFill');
+
+    let pollHandle = null;
+
+    function setStatus(msg) { statusEl.textContent = msg || ''; }
+    function setProgress(show) { progressEl.style.display = show ? 'flex' : 'none'; }
+    function setMeter(percent) {
+      meter.style.display = 'block';
+      meterFill.style.width = (percent || 0) + '%';
+    }
+    function clearMeter() { meter.style.display = 'none'; meterFill.style.width = '0%'; }
+    function setResult(html) { resultEl.style.display = html ? 'block' : 'none'; resultEl.innerHTML = html || ''; }
+
+    function startPolling(jobId, filename) {
+      if (pollHandle) clearInterval(pollHandle);
+      pollHandle = setInterval(async () => {
+        try {
+          const res = await fetch(`/status/${jobId}`);
+          if (!res.ok) throw new Error('Status check failed');
+          const data = await res.json();
+          const percent = data.percent || 0;
+          const done = data.done || 0;
+          const total = data.total || 0;
+          setProgress(true);
+          setMeter(percent);
+          progressText.textContent = `Processing… Page ${done}/${total}`;
+
+          if (data.status === 'done' && data.markdown) {
+            clearInterval(pollHandle);
+            setProgress(false);
+            clearMeter();
+            setStatus('Done.');
+            setResult(`Markdown ready: <a href="${data.markdown}" target="_blank" rel="noopener">${filename}</a>`);
+          } else if (data.status === 'error') {
+            clearInterval(pollHandle);
+            setProgress(false);
+            clearMeter();
+            setStatus('Error: ' + (data.error || 'Unknown error'));
+          }
+        } catch (err) {
+          // keep polling; network hiccups can occur
+        }
+      }, 1000);
+    }
+
+    async function uploadFile(file) {
+      if (!file) return;
+      setStatus(`Selected: ${file.name}`);
+      setProgress(true);
+      clearMeter();
+      setResult('');
+
+      const formData = new FormData();
+      formData.append('file', file);
+
+      try {
+        const res = await fetch('/upload', { method: 'POST', body: formData });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.detail || 'Upload failed');
+        }
+        const data = await res.json();
+        setStatus(`Uploaded. Pages: ${data.total}. Processing started…`);
+        startPolling(data.job_id, data.filename);
+      } catch (err) {
+        setProgress(false);
+        clearMeter();
+        setStatus('Error: ' + err.message);
+      }
+    }
+
+    // Drag & drop
+    ['dragenter','dragover'].forEach(evt => {
+      dropzone.addEventListener(evt, (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
+    });
+    ['dragleave','drop'].forEach(evt => {
+      dropzone.addEventListener(evt, (e) => { e.preventDefault(); dropzone.classList.remove('dragover'); });
+    });
+    dropzone.addEventListener('drop', (e) => {
+      const file = e.dataTransfer?.files?.[0];
+      if (file && file.type === 'application/pdf') uploadFile(file);
+      else setStatus('Please drop a PDF file.');
+    });
+    dropzone.addEventListener('click', () => fileInput.click());
+    browseBtn.addEventListener('click', (e) => { e.stopPropagation(); fileInput.click(); });
+    fileInput.addEventListener('change', (e) => uploadFile(e.target.files[0]));
+  </script>
+</body>
+</html>
