@@ -1,7 +1,6 @@
 """PDF text extraction using Azure Document Intelligence OCR."""
 import os
 import subprocess
-import base64
 import time
 from io import BytesIO
 from typing import Callable, List, Optional
@@ -10,6 +9,8 @@ import requests
 from dotenv import load_dotenv
 from PIL import Image
 from pypdf import PdfReader
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Load environment variables from .env file
 load_dotenv()
@@ -17,7 +18,7 @@ load_dotenv()
 # Increase PIL image size limit to handle large PDF renders
 Image.MAX_IMAGE_PIXELS = 200_000_000  # 200 megapixels
 
-DEFAULT_DPI = 1200
+DEFAULT_DPI = 300
 
 
 def tool_exists(name: str) -> bool:
@@ -36,6 +37,7 @@ def render_page_to_png(pdf_path: str, page_number: int, out_png: str, dpi: int =
     try:
         subprocess.run([
             "pdftoppm",
+            "-q",
             "-f", str(page_number),
             "-l", str(page_number),
             "-r", str(dpi),
@@ -43,7 +45,7 @@ def render_page_to_png(pdf_path: str, page_number: int, out_png: str, dpi: int =
             "-singlefile",
             pdf_path,
             os.path.splitext(out_png)[0],
-        ], check=True)
+        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         return os.path.exists(out_png)
     except (OSError, subprocess.CalledProcessError):
         return False
@@ -65,7 +67,7 @@ def azure_document_intelligence_ocr(png_path: str) -> str:
         # Read and resize the image file for Azure compatibility
         with Image.open(png_path) as img:
             # Azure Document Intelligence has size limits, resize if too large
-            max_dimension = 4000  # Azure's limit is around 4K pixels
+            max_dimension = 2400  # keep payload small and within service limits
             if img.width > max_dimension or img.height > max_dimension:
                 # Calculate new dimensions maintaining aspect ratio
                 ratio = min(max_dimension / img.width, max_dimension / img.height)
@@ -73,10 +75,30 @@ def azure_document_intelligence_ocr(png_path: str) -> str:
                 new_height = int(img.height * ratio)
                 img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)  # type: ignore
 
-            # Convert to bytes
-            img_buffer = BytesIO()
-            img.save(img_buffer, format='PNG')
-            image_data = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
+            # Convert to JPEG bytes with adaptive compression to keep payload small
+            img = img.convert("RGB")
+            target_bytes = 1_500_000  # ~1.5 MB target per page
+            quality = 85
+            downscale_tries = 0
+            while True:
+                img_buffer = BytesIO()
+                img.save(img_buffer, format="JPEG", quality=quality, optimize=True)
+                image_bytes = img_buffer.getvalue()
+                if len(image_bytes) <= target_bytes:
+                    break
+                # Reduce quality first, then downscale if still too large
+                if quality > 65:
+                    quality = max(60, quality - 10)
+                elif downscale_tries < 2:
+                    # Downscale by 85% and retry from higher quality
+                    downscale_tries += 1
+                    new_w = int(img.width * 0.85)
+                    new_h = int(img.height * 0.85)
+                    img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)  # type: ignore
+                    quality = 80
+                else:
+                    # Accept current bytes if we've tried enough
+                    break
 
         # Prepare the request URL
         url = (
@@ -84,19 +106,33 @@ def azure_document_intelligence_ocr(png_path: str) -> str:
             f"documentModels/prebuilt-read:analyze?api-version=2023-07-31"
         )
 
-        # Prepare headers
+        # Prepare headers for binary upload
         headers = {
             "Ocp-Apim-Subscription-Key": key,
-            "Content-Type": "application/json"
+            "Content-Type": "application/octet-stream",
+            "Accept": "application/json",
         }
 
-        # Prepare the request body
-        payload = {
-            "base64Source": image_data
-        }
+        # Create a session with retry for robust networking
+        session = requests.Session()
+        retries = Retry(
+            total=3,
+            connect=3,
+            read=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST"],
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retries)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
 
         # Start the analysis
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        try:
+            response = session.post(url, headers=headers, data=image_bytes, timeout=300)
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"Azure Document Intelligence POST failed: {e}") from e
 
         if response.status_code != 202:
             raise RuntimeError(
@@ -112,13 +148,19 @@ def azure_document_intelligence_ocr(png_path: str) -> str:
             )
 
         # Poll for results
-        for _ in range(30):  # 30 second timeout
-            time.sleep(1)
-            result_response = requests.get(
-                result_url,
-                headers={"Ocp-Apim-Subscription-Key": key},
-                timeout=30
-            )
+        start_time = time.monotonic()
+        # Poll up to ~180 seconds, honoring Retry-After and using ~2s cadence
+        while (time.monotonic() - start_time) < 180:
+            try:
+                result_response = session.get(
+                    result_url,
+                    headers={"Ocp-Apim-Subscription-Key": key},
+                    timeout=60,
+                )
+            except requests.exceptions.RequestException:
+                # Transient network error (e.g., NameResolutionError). Backoff and retry.
+                time.sleep(5)
+                continue
 
             if result_response.status_code == 200:
                 result = result_response.json()
@@ -138,20 +180,37 @@ def azure_document_intelligence_ocr(png_path: str) -> str:
 
                     return "\n".join(text_parts)
 
-                elif status == "failed":
+                if status == "failed":
                     raise RuntimeError(
                         f"Azure Document Intelligence analysis failed: {result}"
                     )
 
-                # Still processing, continue polling
-            else:
-                raise RuntimeError(
-                    f"Failed to poll Azure results: {result_response.status_code}"
-                )
+                # Still running: wait per Retry-After or default ~2s
+                retry_after = result_response.headers.get("Retry-After")
+                try:
+                    wait_s = max(2, int(retry_after)) if retry_after else 2
+                except ValueError:
+                    wait_s = 2
+                time.sleep(wait_s)
+                continue
+
+            # Handle throttling or transient errors with a short backoff
+            if result_response.status_code in (429, 500, 502, 503, 504):
+                retry_after = result_response.headers.get("Retry-After")
+                try:
+                    wait_s = max(2, int(retry_after)) if retry_after else 5
+                except ValueError:
+                    wait_s = 5
+                time.sleep(wait_s)
+                continue
+
+            raise RuntimeError(
+                f"Failed to poll Azure results: {result_response.status_code} - {result_response.text}"
+            )
 
         # Timeout
         raise RuntimeError(
-            "Azure Document Intelligence analysis timed out after 30 seconds"
+            "Azure Document Intelligence analysis timed out after 180 seconds"
         )
 
     except Exception as e:
@@ -224,6 +283,9 @@ def extract_pdf_to_markdown(
                 progress(idx + 1, total_to_process)
             except (OSError, ValueError):
                 pass
+
+        # Gentle pacing between page submissions to avoid hitting service TPS limits
+        time.sleep(0.3)
 
     with open(out_md_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))

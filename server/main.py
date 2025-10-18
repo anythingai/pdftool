@@ -81,7 +81,7 @@ def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
             if j is not None:
                 j["status"] = "done"
                 j["markdown"] = f"/download/{out_md_name}"
-        except (OSError, ValueError) as e:
+        except Exception as e:
             j = JOBS.get(job)
             if j is not None:
                 j["status"] = "error"
